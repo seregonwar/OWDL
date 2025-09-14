@@ -1,4 +1,4 @@
-# OWDL
+# OWDL - Work In Progress
 
 <p align="center">
   <img src="https://img.shields.io/badge/rust-202124?style=for-the-badge&logo=rust&logoColor=white" alt="Rust Badge"/>
