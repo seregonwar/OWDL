@@ -1,0 +1,7 @@
+/owl-cpp
+/target
+/.cargo
+/nexus802/target
+docs/Localizzazione Firmware Intel AX200 e Patching Run.md
+*.lock
+*.pid

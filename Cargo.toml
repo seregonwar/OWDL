@@ -6,6 +6,10 @@ authors = ["AWDL Rust Implementation"]
 description = "Rust implementation of Apple Wireless Direct Link (AWDL) protocol"
 license = "MIT"
 
+[features]
+# Optional integration with CommView for WiFi on Windows (FFI to be added)
+commview = []
+
 [dependencies]
 # Network and protocol handling
 tokio = { version = "1.0", features = ["full"] }
@@ -41,6 +45,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.0", features = ["v4", "serde"] }
+
+# Local multi-tier 802.11 access layer (WSL2 bridge)
+nexus802 = { path = "nexus802" }
 
 # Collections and data structures
 hashbrown = "0.14"

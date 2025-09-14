@@ -10,7 +10,9 @@ use crate::sync::AwdlSyncManager;
 use crate::election::AwdlElectionManager;
 use crate::channel::AwdlChannelManager;
 use super::io::{IoManager, IoConfig};
-use super::event::{EventManager, EventConfig};
+use super::event::{EventManager, EventConfig, AwdlEvent, EventPriority, EventHandler};
+use super::io::IoEvent;
+use super::io::IoEventHandler;
 use super::service::{ServiceManager, ServiceConfig};
 use super::config::DaemonConfig;
 
@@ -22,6 +24,49 @@ use tokio::sync::{RwLock, Mutex};
 use serde::{Deserialize, Serialize};
 
 
+
+/// Bridge to forward IoEvents into the EventManager as AwdlEvents
+struct IoToEventBridge {
+    event_manager: Arc<Mutex<EventManager>>,
+}
+
+#[async_trait::async_trait]
+impl IoEventHandler for IoToEventBridge {
+    async fn handle_event(&self, event: IoEvent) -> Result<()> {
+        // Forward all Io events into the EventManager queue
+        self.event_manager
+            .lock()
+            .await
+            .emit(AwdlEvent::Io(event), EventPriority::Normal)
+            .await
+    }
+}
+
+/// Simple event logger to observe Io events in logs
+struct EventLogger;
+
+#[async_trait::async_trait]
+impl EventHandler for EventLogger {
+    async fn handle_event(&self, event: &AwdlEvent) -> Result<()> {
+        match event {
+            AwdlEvent::Io(ioe) => match ioe {
+                super::io::IoEvent::RawPacket { data } => {
+                    log::debug!("EventLogger: RawPacket len={} bytes", data.len());
+                }
+                super::io::IoEvent::PacketReceived { data, source } => {
+                    log::debug!("EventLogger: UDP/TCP PacketReceived from {} len={}", source, data.len());
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &str { "event_logger" }
+
+    fn can_handle(&self, _event: &AwdlEvent) -> bool { true }
+}
 
 /// Daemon state enumeration
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,6 +177,7 @@ impl AwdlDaemon {
         })
     }
 
+
     /// Initialize the daemon
     pub async fn init(&mut self) -> Result<()> {
         log::info!("Initializing AWDL daemon...");
@@ -168,17 +214,24 @@ impl AwdlDaemon {
         // Set state to running
         *self.state.write().await = DaemonState::Running;
         
+        // Start Event Manager (handles its own event loop and timers)
+        self.event_manager.lock().await.start().await?;
+
+        // Register a basic event logger to observe Io events
+        self.event_manager
+            .lock()
+            .await
+            .add_handler(Arc::new(EventLogger))
+            .await;
+
+        // Wire Io -> Event bridge so IoEvent gets forwarded to EventManager
+        let bridge = Arc::new(IoToEventBridge {
+            event_manager: Arc::clone(&self.event_manager),
+        });
+        self.io_manager.lock().await.add_event_handler(bridge).await;
+
         // Start I/O manager
         self.io_manager.lock().await.start().await?;
-        
-        // Start event loop
-        let event_manager = Arc::clone(&self.event_manager);
-        let state = Arc::clone(&self.state);
-        tokio::spawn(async move {
-            if let Err(e) = Self::run_event_loop(event_manager, state).await {
-                log::error!("Event loop error: {}", e);
-            }
-        });
         
         // Start heartbeat timer
         let stats = Arc::clone(&self.stats);
@@ -212,6 +265,9 @@ impl AwdlDaemon {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
+        
+        // Stop Event Manager before other components
+        self.event_manager.lock().await.stop().await?;
         
         // Stop service manager
         self.service_manager.lock().await.stop().await?;
@@ -320,28 +376,7 @@ impl AwdlDaemon {
         }
     }
 
-    /// Run event loop
-    async fn run_event_loop(
-        event_manager: Arc<Mutex<EventManager>>,
-        state: Arc<RwLock<DaemonState>>,
-    ) -> Result<()> {
-        loop {
-            // Check if we should stop
-            if *state.read().await != DaemonState::Running {
-                break;
-            }
-            
-            // Process events
-            if let Err(e) = event_manager.lock().await.process_events().await {
-                log::error!("Event processing error: {}", e);
-            }
-            
-            // Small delay to prevent busy waiting
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        
-        Ok(())
-    }
+    // The EventManager now owns its internal event loop via start()/stop().
 
     /// Run heartbeat timer
     async fn run_heartbeat(stats: Arc<RwLock<DaemonStats>>, interval_secs: u64) {

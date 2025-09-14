@@ -1,0 +1,96 @@
+# Nexus802 Configuration File
+# Multi-Tier IEEE 802.11 Protocol Implementation
+
+[general]
+log_level = "info"
+enable_monitoring = true
+version = "0.1.0"
+
+[phy]
+# Preferred backend (bridge-wsl2, vendor-commview, vendor-acrylic, ndis-filter)
+preferred_backend = "bridge-wsl2"
+
+# Fallback backends in order of preference
+fallback_backends = [
+    "vendor-commview",
+    "vendor-acrylic", 
+    "ndis-filter"
+]
+
+# Auto-configuration settings
+auto_configure = true
+auto_fallback = true
+fallback_threshold = 100  # frames/sec
+retry_interval = 30       # seconds
+
+# Preferred monitor mode type
+preferred_monitor_mode = "WdiRaw"
+
+# Default channel configuration
+[phy.default_channel]
+primary = 6
+width = 20
+center_freq = 2437
+secondary_offset = 0
+
+# WSL2 Bridge Configuration (Tier 2)
+[bridge]
+wsl_distribution = "Ubuntu"
+bridge_executable = "/usr/local/bin/nexus802-bridge"
+shared_memory_size = 67108864  # 64MB
+control_pipe_name = "\\\\.\\pipe\\nexus802-control"
+rx_pipe_name = "\\\\.\\pipe\\nexus802-rx"
+tx_pipe_name = "\\\\.\\pipe\\nexus802-tx"
+timeout_seconds = 30
+use_shared_memory = true
+
+# Vendor Driver Configuration
+[vendor]
+
+# CommView for WiFi
+[vendor.commview]
+dll_path = "C:\\Program Files\\CommView for WiFi\\cv4w.dll"
+device = "0"  # Device index or name
+promiscuous = true
+buffer_size_mb = 64
+
+# Acrylic WiFi Professional
+[vendor.acrylic]
+dll_path = "C:\\Program Files\\Acrylic WiFi Professional\\AcrylicWiFiAPI.dll"
+adapter_guid = ""  # Set your adapter GUID
+capture_mode = "monitor"
+
+# OmniPeek
+[vendor.omnipeek]
+sdk_path = "C:\\Program Files\\Wildpackets\\OmniPeek\\SDK"
+adapter_name = ""  # Set your adapter name
+capture_filter = ""  # Optional capture filter
+
+# NDIS Filter Driver Configuration (Tier 1)
+[ndis]
+service_name = "Nexus802Filter"
+device_link = "\\\\.\\Nexus802Phy"
+shared_section_name = "Nexus802SharedSection"
+ring_buffer_size = 1024
+hvci_compatible = true
+
+# Performance Configuration
+[performance]
+ring_buffer_size = 1024
+worker_threads = 0  # 0 = auto-detect
+numa_aware = true
+stats_interval_seconds = 60
+
+# Memory pool configuration
+[performance.memory_pools]
+small_frame_pool = 512   # < 256 bytes
+medium_frame_pool = 256  # 256-1500 bytes  
+large_frame_pool = 64    # > 1500 bytes
+
+# Security Configuration
+[security]
+require_signed_drivers = true
+allow_test_certificates = false
+require_ev_certificates = false
+enable_code_integrity = true
+trusted_cert_store = ""  # Optional path to trusted certificate store

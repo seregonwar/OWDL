@@ -14,6 +14,18 @@ use std::collections::HashMap;
 use std::net::{SocketAddr, IpAddr, Ipv4Addr};
 use serde::{Deserialize, Serialize};
 use bytes::{Bytes, BytesMut};
+#[cfg(windows)]
+use pcap as winpcap;
+#[cfg(windows)]
+use tokio::sync::mpsc as tokio_mpsc;
+#[cfg(windows)]
+use nexus802::{
+    phy::{PhyBackend as NexusPhyBackend, MonitorModeType as NexusMonitorMode, ChannelConfig as NexusChannelConfig},
+};
+#[cfg(windows)]
+use nexus802::bridge::BridgeBackend as NexusBridgeBackend;
+#[cfg(windows)]
+use nexus802::config::BridgeConfig as NexusBridgeConfig;
 
 /// I/O configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +94,10 @@ pub enum IoEvent {
     PacketReceived {
         data: Bytes,
         source: SocketAddr,
+    },
+    /// Raw 802.11 packet (captured via Npcap/pcap) - no socket address
+    RawPacket {
+        data: Bytes,
     },
     /// Packet sent
     PacketSent {
@@ -183,6 +199,12 @@ pub struct IoManager {
     next_conn_id: Arc<Mutex<u64>>,
     /// Running state
     running: Arc<RwLock<bool>>,
+    /// Windows: Active pcap capture handle when in raw mode
+    #[cfg(windows)]
+    pcap_handle: Option<Arc<Mutex<winpcap::Capture<winpcap::Active>>>>,
+    /// Windows: Nexus802 bridge backend (WSL2) when used instead of Npcap
+    #[cfg(windows)]
+    nexus_backend: Option<Arc<Mutex<Box<dyn NexusPhyBackend>>>>,
 }
 
 impl std::fmt::Debug for IoManager {
@@ -211,6 +233,10 @@ impl IoManager {
             event_handlers: Arc::new(RwLock::new(Vec::new())),
             next_conn_id: Arc::new(Mutex::new(1)),
             running: Arc::new(RwLock::new(false)),
+            #[cfg(windows)]
+            pcap_handle: None,
+            #[cfg(windows)]
+            nexus_backend: None,
         })
     }
 
@@ -218,25 +244,48 @@ impl IoManager {
     pub async fn init(&mut self) -> Result<()> {
         log::info!("Initializing I/O manager...");
         
-        // Create UDP socket
-        let udp_addr = SocketAddr::new(self.config.bind_address, self.config.udp_port);
-        let udp_socket = UdpSocket::bind(udp_addr).await
-            .map_err(|e| AwdlError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to bind UDP socket: {}", e))))?;
+        // Windows raw mode via Npcap/pcap
+        #[cfg(windows)]
+        if self.config.raw_socket {
+            // Prefer Nexus802 WSL2 bridge if interface is explicitly "bridge"
+            if self.config.interface.to_lowercase() == "bridge" {
+                log::info!("Initializing Nexus802 WSL2 bridge backend (localhost:9000/9001)...");
+                let bridge_cfg = NexusBridgeConfig {
+                    wsl_distribution: "Ubuntu".to_string(),
+                    bridge_executable: "/usr/local/bin/nexus802-bridge".to_string(),
+                    shared_memory_size: 64 * 1024 * 1024,
+                    control_pipe_name: "\\\\.\\pipe\\nexus802-control".to_string(),
+                    rx_pipe_name: "\\\\.\\pipe\\nexus802-rx".to_string(),
+                    tx_pipe_name: "\\\\.\\pipe\\nexus802-tx".to_string(),
+                    timeout_seconds: 30,
+                    use_shared_memory: true,
+                };
+                let mut backend_box: Box<dyn NexusPhyBackend> = Box::new(NexusBridgeBackend::new(bridge_cfg));
+                backend_box.initialize().await.map_err(|e| AwdlError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("Nexus802 init failed: {}", e))))?;
+                // Enable monitor mode and set default channel 6
+                backend_box.enable_monitor_mode(NexusMonitorMode::Bridge).await.map_err(|e| AwdlError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("Nexus802 enable monitor failed: {}", e))))?;
+                let ch = NexusChannelConfig { primary: 6, width: 20, center_freq: 2412 + (6 - 1) * 5, secondary_offset: None };
+                let _ = backend_box.set_channel(ch).await;
+                self.nexus_backend = Some(Arc::new(Mutex::new(backend_box)));
+                log::info!("Nexus802 bridge backend initialized");
+            } else {
+                log::info!("Initializing raw 802.11 capture via Npcap on interface '{}'...", self.config.interface);
+                // Try to open the device by name. On Windows this is typically \\Device\\NPF_{GUID}
+                let mut cap = winpcap::Capture::from_device(self.config.interface.as_str())
+                    .map_err(|e| AwdlError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("pcap from_device failed: {}", e))))?;
+                let mut cap = cap
+                    .immediate_mode(true)
+                    .timeout(1000)
+                    .open()
+                    .map_err(|e| AwdlError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("pcap open failed: {}", e))))?;
+                let datalink = cap.get_datalink();
+                log::info!("pcap datalink: {:?}", datalink);
+                self.pcap_handle = Some(Arc::new(Mutex::new(cap)));
+            }
+        }
         
-        // Note: tokio::net::UdpSocket doesn't support setting buffer sizes directly
-        // Buffer size configuration would need to be handled at the OS level or through socket2 crate
-        
-        self.udp_socket = Some(Arc::new(udp_socket));
-        
-        // Create TCP listener
-        let tcp_addr = SocketAddr::new(self.config.bind_address, self.config.tcp_port);
-        let tcp_listener = TcpListener::bind(tcp_addr).await
-            .map_err(|e| AwdlError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to bind TCP listener: {}", e))))?;
-        
-        self.tcp_listener = Some(Arc::new(tcp_listener));
-        
-        log::info!("I/O manager initialized - UDP: {}, TCP: {}", udp_addr, tcp_addr);
-        Ok(())
+        log::info!("I/O manager initialized - Raw (Npcap)");
+        return Ok(());
     }
 
     /// Start I/O manager
@@ -245,6 +294,96 @@ impl IoManager {
         
         *self.running.write().await = true;
         
+        // Windows raw mode via Npcap
+        #[cfg(windows)]
+        if self.config.raw_socket {
+            // If using Nexus802 backend, spawn its RX loop
+            if let Some(backend) = &self.nexus_backend {
+                let backend_arc = Arc::clone(backend);
+                let handlers = Arc::clone(&self.event_handlers);
+                let running = Arc::clone(&self.running);
+                let stats = Arc::clone(&self.stats);
+                tokio::spawn(async move {
+                    while *running.read().await {
+                        let mut guard = backend_arc.lock().await;
+                        match guard.recv_frame_timeout(std::time::Duration::from_millis(200)).await {
+                            Ok(Some((frame, _meta))) => {
+                                {
+                                    let mut s = stats.write().await;
+                                    s.packets_received += 1;
+                                    s.bytes_received += frame.len() as u64;
+                                }
+                                let event = IoEvent::RawPacket { data: Bytes::from(frame) };
+                                let handlers_guard = handlers.read().await;
+                                for h in handlers_guard.iter() {
+                                    if let Err(e) = h.handle_event(event.clone()).await { log::error!("RawPacket handler error: {}", e); }
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                log::warn!("Nexus802 RX error: {}", e);
+                                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                            }
+                        }
+                    }
+                });
+            } else if let Some(handle) = &self.pcap_handle {
+                let cap = Arc::clone(handle);
+                let stats = Arc::clone(&self.stats);
+                let handlers = Arc::clone(&self.event_handlers);
+                let running = Arc::clone(&self.running);
+
+                // Channel from blocking reader to async forwarder
+                let (tx, mut rx) = tokio_mpsc::unbounded_channel::<Bytes>();
+
+                // Blocking reader
+                tokio::task::spawn_blocking(move || {
+                    loop {
+                        // Read next packet under lock and copy data before releasing lock
+                        let maybe_data: Option<Bytes> = {
+                            let mut guard = cap.blocking_lock();
+                            match guard.next_packet() {
+                                Ok(packet) => Some(Bytes::copy_from_slice(packet.data)),
+                                Err(_) => None,
+                            }
+                        };
+                        if let Some(data) = maybe_data {
+                            let _ = tx.send(data);
+                        } else {
+                            // No packet; continue looping (timeout(1) keeps it responsive)
+                        }
+                    }
+                });
+
+                // Async forwarder: update stats and notify handlers
+                tokio::spawn(async move {
+                    while *running.read().await {
+                        if let Some(data) = rx.recv().await {
+                            // Update statistics
+                            {
+                                let mut stats_guard = stats.write().await;
+                                stats_guard.bytes_received += data.len() as u64;
+                                stats_guard.packets_received += 1;
+                                stats_guard.avg_packet_size = 
+                                    stats_guard.bytes_received as f64 / stats_guard.packets_received as f64;
+                            }
+
+                            // Notify handlers
+                            let event = IoEvent::RawPacket { data };
+                            let handlers_guard = handlers.read().await;
+                            for handler in handlers_guard.iter() {
+                                if let Err(e) = handler.handle_event(event.clone()).await {
+                                    log::error!("Raw event handler error: {}", e);
+                                }
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                });
+            }
+        }
+
         // Start UDP receiver
         if let Some(udp_socket) = &self.udp_socket {
             let socket = Arc::clone(udp_socket);
@@ -285,6 +424,19 @@ impl IoManager {
         let mut connections = self.connections.write().await;
         for (_, mut conn) in connections.drain() {
             conn.state = ConnectionState::Closed;
+        }
+        
+        // Windows: drop pcap handle
+        #[cfg(windows)]
+        {
+            self.pcap_handle = None;
+            if let Some(backend) = &self.nexus_backend {
+                if let Ok(mut guard) = backend.try_lock() {
+                    let _ = guard.disable_monitor_mode().await;
+                    let _ = guard.shutdown().await;
+                }
+            }
+            self.nexus_backend = None;
         }
         
         log::info!("I/O manager stopped successfully");
